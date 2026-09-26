@@ -1,0 +1,237 @@
+name: Build APK
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Fetshou El Kotob APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout workflow repository
+        uses: actions/checkout@v4
+
+      # ============================================================
+      # 1. Find and extract the uploaded ZIP project
+      # ============================================================
+      - name: Find project ZIP
+        id: find_zip
+        shell: bash
+        run: |
+          set -e
+
+          ZIP_FILE=$(find . -maxdepth 3 -type f \
+            \( -iname "*.zip" \) \
+            ! -path "./.git/*" \
+            | head -n 1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: No project ZIP file was found."
+            exit 1
+          fi
+
+          echo "Found ZIP: $ZIP_FILE"
+          echo "zip_file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Extract Flutter project
+        shell: bash
+        run: |
+          set -e
+
+          ZIP_FILE="${{ steps.find_zip.outputs.zip_file }}"
+
+          rm -rf extracted_project
+          mkdir -p extracted_project
+
+          unzip -q "$ZIP_FILE" -d extracted_project
+
+          echo "Extracted files:"
+          find extracted_project -maxdepth 3 -type f | head -100
+
+      # ============================================================
+      # 2. Locate the actual Flutter project
+      # ============================================================
+      - name: Locate Flutter project
+        id: locate_project
+        shell: bash
+        run: |
+          set -e
+
+          PUBSPEC=$(find extracted_project \
+            -type f \
+            -name "pubspec.yaml" \
+            -not -path "*/.dart_tool/*" \
+            | head -n 1)
+
+          if [ -z "$PUBSPEC" ]; then
+            echo "ERROR: pubspec.yaml was not found inside the ZIP."
+            echo "The ZIP must contain a Flutter project."
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$PUBSPEC")
+
+          echo "Flutter project found at:"
+          echo "$PROJECT_DIR"
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      # ============================================================
+      # 3. Setup Java
+      # ============================================================
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: "17"
+          cache: gradle
+
+      # ============================================================
+      # 4. Setup Flutter
+      # ============================================================
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Show Flutter version
+        run: flutter --version
+
+      # ============================================================
+      # 5. Prepare Android local.properties
+      # ============================================================
+      - name: Prepare Flutter project
+        working-directory: ${{ steps.locate_project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -e
+
+          flutter doctor -v
+
+          mkdir -p android
+
+          echo "flutter.sdk=$FLUTTER_ROOT" > android/local.properties
+          echo "flutter.versionName=1.0.0" >> android/local.properties
+          echo "flutter.versionCode=1" >> android/local.properties
+
+      # ============================================================
+      # 6. Make Gradle wrapper executable if it exists
+      # ============================================================
+      - name: Prepare Gradle wrapper
+        working-directory: ${{ steps.locate_project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -e
+
+          if [ -f "android/gradlew" ]; then
+            chmod +x android/gradlew
+          else
+            echo "Gradle wrapper not found."
+            echo "Flutter will use the project's Android configuration."
+          fi
+
+      # ============================================================
+      # 7. Install dependencies
+      # ============================================================
+      - name: Flutter pub get
+        working-directory: ${{ steps.locate_project.outputs.project_dir }}
+        run: flutter pub get
+
+      # ============================================================
+      # 8. Format check
+      # ============================================================
+      - name: Check Dart formatting
+        working-directory: ${{ steps.locate_project.outputs.project_dir }}
+        shell: bash
+        run: |
+          dart format --output=none --set-exit-if-changed lib test
+
+      # ============================================================
+      # 9. Static analysis
+      # ============================================================
+      - name: Flutter analyze
+        working-directory: ${{ steps.locate_project.outputs.project_dir }}
+        run: flutter analyze
+
+      # ============================================================
+      # 10. Tests
+      # ============================================================
+      - name: Flutter tests
+        working-directory: ${{ steps.locate_project.outputs.project_dir }}
+        run: flutter test
+
+      # ============================================================
+      # 11. Build release APK
+      # ============================================================
+      - name: Build release APK
+        working-directory: ${{ steps.locate_project.outputs.project_dir }}
+        run: |
+          flutter build apk --release
+
+      # ============================================================
+      # 12. Rename APK
+      # ============================================================
+      - name: Prepare APK artifact
+        working-directory: ${{ steps.locate_project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -e
+
+          APK="build/app/outputs/flutter-apk/app-release.apk"
+
+          if [ ! -f "$APK" ]; then
+            echo "ERROR: Release APK was not generated."
+            exit 1
+          fi
+
+          cp "$APK" "fetshou-el-kotob-release.apk"
+
+          ls -lh "fetshou-el-kotob-release.apk"
+
+      # ============================================================
+      # 13. Upload APK
+      # ============================================================
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fetshou-el-kotob-release-apk
+          path: ${{ steps.locate_project.outputs.project_dir }}/fetshou-el-kotob-release.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      # ============================================================
+      # 14. Upload build information
+      # ============================================================
+      - name: Create build information
+        working-directory: ${{ steps.locate_project.outputs.project_dir }}
+        shell: bash
+        run: |
+          {
+            echo "Fetshou El Kotob"
+            echo "================"
+            echo ""
+            echo "Build: Release APK"
+            echo "Flutter:"
+            flutter --version
+            echo ""
+            echo "APK:"
+            ls -lh fetshou-el-kotob-release.apk
+          } > build-info.txt
+
+      - name: Upload build information
+        uses: actions/upload-artifact@v4
+        with:
+          name: fetshou-el-kotob-build-info
+          path: ${{ steps.locate_project.outputs.project_dir }}/build-info.txt
+          if-no-files-found: error
